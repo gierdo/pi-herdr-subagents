@@ -1,4 +1,6 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { getEnvironmentConfig } from "./config.ts";
 
@@ -132,15 +134,283 @@ function listHerdrWorkspaces(): string | null {
   }
 }
 
+function listHerdrWorktrees(cwd?: string): string | null {
+  try {
+    return herdrExec(["worktree", "list", ...(cwd ? ["--cwd", cwd] : [])]);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeFsPath(targetPath: string, baseCwd?: string): string {
+  const resolved = baseCwd ? resolve(baseCwd, targetPath) : resolve(targetPath);
+  let normalized = resolved;
+  try {
+    normalized = realpathSync(resolved);
+  } catch {
+    normalized = resolved;
+  }
+  return normalized.length > 1 ? normalized.replace(/[\\/]+$/, "") : normalized;
+}
+
+function isPathInside(childPath: string, parentPath: string): boolean {
+  if (!childPath || !parentPath) return false;
+  if (childPath === parentPath) return true;
+  const prefix = parentPath === "/" ? "/" : `${parentPath}${sep}`;
+  return childPath.startsWith(prefix);
+}
+
+type HerdrWorktreeMetadata = {
+  checkout_path?: unknown;
+  repo_root?: unknown;
+};
+
+type HerdrWorkspaceRecord = {
+  workspace_id?: unknown;
+  label?: unknown;
+  worktree?: HerdrWorktreeMetadata | null;
+};
+
+type HerdrWorktreeListEntry = {
+  path?: unknown;
+  branch?: unknown;
+  label?: unknown;
+  open_workspace_id?: unknown;
+};
+
+function parseWorkspaceRecords(output: string): HerdrWorkspaceRecord[] {
+  const parsed = parseHerdrJson(output) as {
+    result?: { workspaces?: unknown };
+    workspaces?: unknown;
+  } | null;
+  const workspaces = parsed?.result?.workspaces ?? parsed?.workspaces;
+  if (!Array.isArray(workspaces)) return [];
+  return workspaces.filter((ws): ws is HerdrWorkspaceRecord => ws != null && typeof ws === "object");
+}
+
+function parseWorktreeListEntries(output: string): HerdrWorktreeListEntry[] {
+  const parsed = parseHerdrJson(output) as {
+    result?: { worktrees?: unknown };
+    worktrees?: unknown;
+  } | null;
+  const worktrees = parsed?.result?.worktrees ?? parsed?.worktrees;
+  if (!Array.isArray(worktrees)) return [];
+  return worktrees.filter((wt): wt is HerdrWorktreeListEntry => wt != null && typeof wt === "object");
+}
+
+function matchWorkspaceForCwd(workspacesOutput: string, cwd: string): string | null {
+  if (!cwd) return null;
+  const normalizedCwd = normalizeFsPath(cwd);
+  let bestWorkspaceId: string | null = null;
+  let bestPathLength = -1;
+
+  for (const ws of parseWorkspaceRecords(workspacesOutput)) {
+    const workspaceId = typeof ws.workspace_id === "string" && ws.workspace_id ? ws.workspace_id : null;
+    if (!workspaceId) continue;
+    const checkoutPath =
+      typeof ws.worktree?.checkout_path === "string" && ws.worktree.checkout_path
+        ? ws.worktree.checkout_path
+        : typeof ws.worktree?.repo_root === "string" && ws.worktree.repo_root
+          ? ws.worktree.repo_root
+          : null;
+    if (!checkoutPath) continue;
+    const normalizedRoot = normalizeFsPath(checkoutPath);
+    if (isPathInside(normalizedCwd, normalizedRoot) && normalizedRoot.length > bestPathLength) {
+      bestWorkspaceId = workspaceId;
+      bestPathLength = normalizedRoot.length;
+    }
+  }
+
+  return bestWorkspaceId;
+}
+
+function matchOpenWorktreeForCwd(worktreesOutput: string, cwd: string): string | null {
+  if (!cwd) return null;
+  const normalizedCwd = normalizeFsPath(cwd);
+  let bestWorkspaceId: string | null = null;
+  let bestPathLength = -1;
+
+  for (const entry of parseWorktreeListEntries(worktreesOutput)) {
+    const workspaceId =
+      typeof entry.open_workspace_id === "string" && entry.open_workspace_id
+        ? entry.open_workspace_id
+        : null;
+    const entryPath = typeof entry.path === "string" && entry.path ? entry.path : null;
+    if (!workspaceId || !entryPath) continue;
+    const normalizedRoot = normalizeFsPath(entryPath);
+    if (isPathInside(normalizedCwd, normalizedRoot) && normalizedRoot.length > bestPathLength) {
+      bestWorkspaceId = workspaceId;
+      bestPathLength = normalizedRoot.length;
+    }
+  }
+
+  return bestWorkspaceId;
+}
+
+function looksLikePathSelector(selector: string): boolean {
+  return (
+    selector.startsWith("/") ||
+    selector.startsWith("./") ||
+    selector.startsWith("../") ||
+    selector === "." ||
+    selector === ".." ||
+    /^[a-zA-Z]:[\\/]/.test(selector)
+  );
+}
+
+function matchExplicitWorkspace(
+  workspacesOutput: string | null,
+  worktreesOutput: string | null,
+  selector: string,
+  baseCwd?: string,
+): string | null {
+  const trimmed = selector.trim();
+  if (!trimmed) return null;
+
+  const isPathLike = looksLikePathSelector(trimmed);
+  const normalizedSelectorPath = normalizeFsPath(trimmed, baseCwd);
+  const workspaces = workspacesOutput ? parseWorkspaceRecords(workspacesOutput) : [];
+  const worktreeEntries = worktreesOutput ? parseWorktreeListEntries(worktreesOutput) : [];
+
+  for (const ws of workspaces) {
+    if (typeof ws.workspace_id === "string" && ws.workspace_id === trimmed) {
+      return ws.workspace_id;
+    }
+  }
+
+  for (const ws of workspaces) {
+    const workspaceId = typeof ws.workspace_id === "string" && ws.workspace_id ? ws.workspace_id : null;
+    if (!workspaceId) continue;
+    const checkoutPath =
+      typeof ws.worktree?.checkout_path === "string" && ws.worktree.checkout_path
+        ? ws.worktree.checkout_path
+        : typeof ws.worktree?.repo_root === "string" && ws.worktree.repo_root
+          ? ws.worktree.repo_root
+          : null;
+    if (!checkoutPath) continue;
+    if (normalizedSelectorPath === normalizeFsPath(checkoutPath)) {
+      return workspaceId;
+    }
+  }
+
+  for (const ws of workspaces) {
+    if (
+      typeof ws.workspace_id === "string" &&
+      ws.workspace_id &&
+      typeof ws.label === "string" &&
+      ws.label === trimmed
+    ) {
+      return ws.workspace_id;
+    }
+  }
+
+  for (const entry of worktreeEntries) {
+    const workspaceId =
+      typeof entry.open_workspace_id === "string" && entry.open_workspace_id
+        ? entry.open_workspace_id
+        : null;
+    if (!workspaceId) continue;
+    if (
+      workspaceId === trimmed ||
+      (typeof entry.branch === "string" && entry.branch === trimmed) ||
+      (typeof entry.label === "string" && entry.label === trimmed)
+    ) {
+      return workspaceId;
+    }
+  }
+
+  for (const entry of worktreeEntries) {
+    const workspaceId =
+      typeof entry.open_workspace_id === "string" && entry.open_workspace_id
+        ? entry.open_workspace_id
+        : null;
+    const entryPath = typeof entry.path === "string" && entry.path ? entry.path : null;
+    if (!workspaceId || !entryPath) continue;
+    if (normalizedSelectorPath === normalizeFsPath(entryPath)) {
+      return workspaceId;
+    }
+  }
+
+  if (isPathLike) {
+    let bestWorkspaceId: string | null = null;
+    let bestPathLength = -1;
+
+    for (const ws of workspaces) {
+      const workspaceId = typeof ws.workspace_id === "string" && ws.workspace_id ? ws.workspace_id : null;
+      if (!workspaceId) continue;
+      const checkoutPath =
+        typeof ws.worktree?.checkout_path === "string" && ws.worktree.checkout_path
+          ? ws.worktree.checkout_path
+          : typeof ws.worktree?.repo_root === "string" && ws.worktree.repo_root
+            ? ws.worktree.repo_root
+            : null;
+      if (!checkoutPath) continue;
+      const normalizedRoot = normalizeFsPath(checkoutPath);
+      if (isPathInside(normalizedSelectorPath, normalizedRoot) && normalizedRoot.length > bestPathLength) {
+        bestWorkspaceId = workspaceId;
+        bestPathLength = normalizedRoot.length;
+      }
+    }
+
+    for (const entry of worktreeEntries) {
+      const workspaceId =
+        typeof entry.open_workspace_id === "string" && entry.open_workspace_id
+          ? entry.open_workspace_id
+          : null;
+      const entryPath = typeof entry.path === "string" && entry.path ? entry.path : null;
+      if (!workspaceId || !entryPath) continue;
+      const normalizedRoot = normalizeFsPath(entryPath);
+      if (isPathInside(normalizedSelectorPath, normalizedRoot) && normalizedRoot.length > bestPathLength) {
+        bestWorkspaceId = workspaceId;
+        bestPathLength = normalizedRoot.length;
+      }
+    }
+
+    if (bestWorkspaceId) return bestWorkspaceId;
+  }
+
+  return null;
+}
+
 export function getHerdrParentPaneId(): string | null {
   return process.env.HERDR_PANE_ID || readCurrentPane().pane_id || null;
 }
 
-function resolveHerdrWorkspaceId(): string {
-  const workspaceId = process.env.HERDR_WORKSPACE_ID || readCurrentPane().workspace_id;
-  if (workspaceId) return workspaceId;
-  const output = listHerdrWorkspaces();
-  const fallback = output === null ? null : parseFirstWorkspaceId(output);
+export function getHerdrCallerWorkspaceId(): string | null {
+  return process.env.HERDR_WORKSPACE_ID || readCurrentPane().workspace_id || null;
+}
+
+export function resolveHerdrWorkspaceId(options?: { cwd?: string; workspace?: string }): string {
+  let workspacesOutput: string | null | undefined;
+  const getWorkspacesOutput = (): string | null => {
+    if (workspacesOutput === undefined) {
+      workspacesOutput = listHerdrWorkspaces();
+    }
+    return workspacesOutput;
+  };
+
+  if (options?.workspace?.trim()) {
+    const wsOut = getWorkspacesOutput();
+    const fromWorkspaces = matchExplicitWorkspace(wsOut, null, options.workspace, options.cwd);
+    if (fromWorkspaces) return fromWorkspaces;
+    const worktreesOutput = listHerdrWorktrees(options.cwd);
+    const fromWorktrees = matchExplicitWorkspace(wsOut, worktreesOutput, options.workspace, options.cwd);
+    if (fromWorktrees) return fromWorktrees;
+  }
+
+  if (options?.cwd) {
+    const wsOut = getWorkspacesOutput();
+    const fromWorkspaces = wsOut ? matchWorkspaceForCwd(wsOut, options.cwd) : null;
+    if (fromWorkspaces) return fromWorkspaces;
+    const worktreesOutput = listHerdrWorktrees(options.cwd);
+    const fromWorktrees = worktreesOutput ? matchOpenWorktreeForCwd(worktreesOutput, options.cwd) : null;
+    if (fromWorktrees) return fromWorktrees;
+  }
+
+  const callerWorkspaceId = getHerdrCallerWorkspaceId();
+  if (callerWorkspaceId) return callerWorkspaceId;
+  const wsOut = getWorkspacesOutput();
+  const fallback = wsOut === null ? null : parseFirstWorkspaceId(wsOut);
   if (fallback) return fallback;
   throw new Error("Cannot resolve a herdr workspace from HERDR_WORKSPACE_ID, pane current, or workspace list.");
 }
@@ -159,8 +429,8 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
   ];
 }
 
-export function createHerdrSurface(name: string, cwd = process.cwd()): string {
-  const workspaceId = resolveHerdrWorkspaceId();
+export function createHerdrSurface(name: string, cwd = process.cwd(), workspace?: string): string {
+  const workspaceId = resolveHerdrWorkspaceId({ cwd, workspace });
   const output = herdrExec(buildTabCreateArgs(name, cwd, workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
@@ -357,4 +627,7 @@ export const __herdrTest__ = {
   parsePaneGetOutput,
   parsePaneGetError,
   isPaneMissingError,
+  matchWorkspaceForCwd,
+  matchOpenWorktreeForCwd,
+  matchExplicitWorkspace,
 };

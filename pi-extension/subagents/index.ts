@@ -46,6 +46,7 @@ import {
   findLastAssistantMessage,
   findObservedSessionRuntime,
   getNewEntries,
+  getSessionCwd,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -147,6 +148,12 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+    }),
+  ),
+  workspace: Type.Optional(
+    Type.String({
+      description:
+        "Optional Herdr workspace ID, worktree path, or worktree branch/label to place the subagent tab in. When omitted and cwd points to a git worktree open in Herdr, the tab is automatically placed in that worktree's workspace.",
     }),
   ),
   fork: Type.Optional(
@@ -1214,6 +1221,7 @@ async function launchSubagent(
     name: params.name,
     task: params.task,
     cwd: targetCwdForSession,
+    workspace: params.workspace,
     layout: resolveSubagentLayout(),
     command: built.command,
     scriptPath: launchScriptFile,
@@ -1845,6 +1853,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
+        workspace: Type.Optional(
+          Type.String({
+            description:
+              "Optional Herdr workspace ID, worktree path, or worktree branch/label to place the subagent tab in. When omitted and cwd points to a git worktree open in Herdr, the tab is automatically placed in that worktree's workspace.",
+          }),
+        ),
       }),
 
       renderCall(args, theme) {
@@ -1953,10 +1967,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
+        const sessionCwd = getSessionCwd(params.sessionPath);
+        const resumeCwd = sessionCwd && existsSync(sessionCwd) ? sessionCwd : ctx.cwd;
         const surface = await launchSubagentTerminal({
           name,
           task: params.message ?? "resumed session",
-          cwd: ctx.cwd,
+          cwd: resumeCwd,
+          workspace: params.workspace,
           layout: resolveSubagentLayout(),
           command,
           scriptPath: launchScriptFile,

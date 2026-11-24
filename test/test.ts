@@ -16,6 +16,7 @@ import {
 
 import {
   getLeafId,
+  getSessionCwd,
   getNewEntries,
   findLastAssistantMessage,
   findObservedSessionRuntime,
@@ -3209,6 +3210,309 @@ describe("herdr.ts", () => {
         result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
+    });
+  });
+
+  describe("worktree workspace resolution", () => {
+    it("matches exact worktree checkout_path and subdirectories", () => {
+      const workspacesOutput = JSON.stringify({
+        result: {
+          workspaces: [
+            {
+              workspace_id: "w1",
+              label: "main",
+              worktree: { checkout_path: "/repo", repo_root: "/repo" },
+            },
+            {
+              workspace_id: "w2",
+              label: "feat",
+              worktree: { checkout_path: "/repo-worktrees/feat", repo_root: "/repo" },
+            },
+          ],
+        },
+      });
+
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo-worktrees/feat"), "w2");
+      assert.equal(
+        __herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo-worktrees/feat/src/sub"),
+        "w2",
+      );
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo/src"), "w1");
+    });
+
+    it("does not match sibling paths sharing a string prefix", () => {
+      const workspacesOutput = JSON.stringify({
+        result: {
+          workspaces: [
+            {
+              workspace_id: "w1",
+              worktree: { checkout_path: "/repo" },
+            },
+          ],
+        },
+      });
+
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo-other"), null);
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo-other/src"), null);
+    });
+
+    it("prefers the longest matching checkout_path for nested worktrees", () => {
+      const workspacesOutput = JSON.stringify({
+        result: {
+          workspaces: [
+            {
+              workspace_id: "w1",
+              label: "main",
+              worktree: { checkout_path: "/repo", repo_root: "/repo" },
+            },
+            {
+              workspace_id: "w2",
+              label: "feat",
+              worktree: { checkout_path: "/repo/.worktrees/feat", repo_root: "/repo" },
+            },
+          ],
+        },
+      });
+
+      assert.equal(
+        __herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo/.worktrees/feat"),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo/.worktrees/feat/src"),
+        "w2",
+      );
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo/src"), "w1");
+    });
+
+    it("falls back to worktree.repo_root when checkout_path is absent and returns null on mismatch or malformed JSON", () => {
+      const workspacesOutput = JSON.stringify({
+        workspaces: [
+          {
+            workspace_id: "w-root",
+            worktree: { repo_root: "/repo-only" },
+          },
+        ],
+      });
+
+      assert.equal(
+        __herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/repo-only/packages/core"),
+        "w-root",
+      );
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, "/unrelated"), null);
+      assert.equal(__herdrTest__.matchWorkspaceForCwd("not valid json", "/repo-only"), null);
+      assert.equal(__herdrTest__.matchWorkspaceForCwd(workspacesOutput, ""), null);
+    });
+
+    it("matches open_workspace_id from herdr worktree list output and prefers longest path", () => {
+      const worktreesOutput = JSON.stringify({
+        result: {
+          worktrees: [
+            {
+              path: "/repo",
+              branch: "main",
+              label: "main",
+              open_workspace_id: "w1",
+            },
+            {
+              path: "/repo/.worktrees/closed",
+              branch: "feat/closed",
+              label: "closed",
+              open_workspace_id: null,
+            },
+            {
+              path: "/repo/.worktrees/missing-open",
+              branch: "feat/missing",
+              label: "missing",
+            },
+            {
+              path: "/repo/.worktrees/open-feat",
+              branch: "feat/open",
+              label: "open-feat",
+              open_workspace_id: "w2",
+            },
+          ],
+        },
+      });
+
+      assert.equal(
+        __herdrTest__.matchOpenWorktreeForCwd(worktreesOutput, "/repo/.worktrees/open-feat"),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchOpenWorktreeForCwd(worktreesOutput, "/repo/.worktrees/open-feat/src"),
+        "w2",
+      );
+      // Closed worktree nested inside /repo falls back to open /repo (w1), ignoring null/missing open_workspace_id
+      assert.equal(
+        __herdrTest__.matchOpenWorktreeForCwd(worktreesOutput, "/repo/.worktrees/closed/src"),
+        "w1",
+      );
+      assert.equal(
+        __herdrTest__.matchOpenWorktreeForCwd(worktreesOutput, "/outside/repo"),
+        null,
+      );
+      assert.equal(__herdrTest__.matchOpenWorktreeForCwd("malformed", "/repo"), null);
+    });
+
+    it("resolves explicit workspace by workspace_id, workspace label, checkout_path, branch (with slash), or worktree label", () => {
+      const workspacesOutput = JSON.stringify({
+        result: {
+          workspaces: [
+            {
+              workspace_id: "w1",
+              label: "main-ws",
+              worktree: { checkout_path: "/repo", repo_root: "/repo" },
+            },
+            {
+              workspace_id: "w2",
+              label: "feature-ws",
+              worktree: { checkout_path: "/repo/.worktrees/feat", repo_root: "/repo" },
+            },
+          ],
+        },
+      });
+      const worktreesOutput = JSON.stringify({
+        result: {
+          worktrees: [
+            {
+              path: "/repo",
+              branch: "main",
+              label: "main-wt",
+              open_workspace_id: "w1",
+            },
+            {
+              path: "/repo/.worktrees/feat",
+              branch: "feat/worktree-tab",
+              label: "feat-wt",
+              open_workspace_id: "w2",
+            },
+          ],
+        },
+      });
+
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(workspacesOutput, worktreesOutput, "w2", "/repo"),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(workspacesOutput, worktreesOutput, "feature-ws", "/repo"),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(
+          workspacesOutput,
+          worktreesOutput,
+          "/repo/.worktrees/feat",
+          "/repo",
+        ),
+        "w2",
+      );
+      // Branch with `/` must match w2 and not falsely match enclosing `/repo` workspace via baseCwd
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(
+          workspacesOutput,
+          worktreesOutput,
+          "feat/worktree-tab",
+          "/repo",
+        ),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(workspacesOutput, worktreesOutput, "feat-wt", "/repo"),
+        "w2",
+      );
+    });
+
+    it("matches explicit subpath selectors inside an open worktree and returns null on unknown or empty selectors", () => {
+      const workspacesOutput = JSON.stringify({
+        result: {
+          workspaces: [
+            {
+              workspace_id: "w1",
+              label: "main",
+              worktree: { checkout_path: "/repo" },
+            },
+            {
+              workspace_id: "w2",
+              label: "feat",
+              worktree: { checkout_path: "/repo/.worktrees/feat" },
+            },
+          ],
+        },
+      });
+
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(
+          workspacesOutput,
+          null,
+          "/repo/.worktrees/feat/packages/a",
+          "/repo",
+        ),
+        "w2",
+      );
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(
+          workspacesOutput,
+          null,
+          "./.worktrees/feat/packages/a",
+          "/repo",
+        ),
+        "w2",
+      );
+      assert.equal(__herdrTest__.matchExplicitWorkspace(workspacesOutput, null, "   ", "/repo"), null);
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(workspacesOutput, null, "nonexistent-branch", "/repo"),
+        null,
+      );
+      assert.equal(
+        __herdrTest__.matchExplicitWorkspace(workspacesOutput, null, "/outside/path", "/repo"),
+        null,
+      );
+    });
+
+    it("getSessionCwd extracts cwd from session header and returns null when missing or absent", () => {
+      withTempDir((dir) => {
+        const withCwd = join(dir, "with-cwd.jsonl");
+        writeFileSync(
+          withCwd,
+          JSON.stringify({
+            type: "session",
+            id: "sess-1",
+            version: 3,
+            cwd: "/repo/.worktrees/feat",
+          }) + "\n",
+        );
+        assert.equal(getSessionCwd(withCwd), "/repo/.worktrees/feat");
+
+        const withoutCwd = join(dir, "without-cwd.jsonl");
+        writeFileSync(
+          withoutCwd,
+          JSON.stringify({ type: "session", id: "sess-2", version: 3 }) + "\n",
+        );
+        assert.equal(getSessionCwd(withoutCwd), null);
+
+        assert.equal(getSessionCwd(join(dir, "does-not-exist.jsonl")), null);
+      });
+    });
+
+    it("exposes optional workspace property on subagent and subagent_resume tool schemas", () => {
+      const mock = createMockExtensionApi();
+      subagentsModule.default(mock.api);
+
+      const subagentTool = mock.registeredTools.find((t) => t.name === "subagent");
+      const resumeTool = mock.registeredTools.find((t) => t.name === "subagent_resume");
+
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+      assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+      assert.ok(
+        subagentTool.parameters?.properties?.workspace,
+        "expected subagent tool schema to include workspace property",
+      );
+      assert.ok(
+        resumeTool.parameters?.properties?.workspace,
+        "expected subagent_resume tool schema to include workspace property",
+      );
     });
   });
 });

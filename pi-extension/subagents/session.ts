@@ -76,6 +76,19 @@ function readEntries(sessionFile: string): SessionEntry[] {
 }
 
 /**
+ * Return the session's working directory from its header entry, or null if unavailable.
+ */
+export function getSessionCwd(sessionFile: string): string | null {
+  try {
+    const entries = readEntries(sessionFile);
+    const sessionEntry = entries.find((entry) => entry.type === "session");
+    return typeof sessionEntry?.cwd === "string" && sessionEntry.cwd ? sessionEntry.cwd : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Return the id of the last entry in the session file (current branch point / leaf).
  */
 export function getLeafId(sessionFile: string): string | null {

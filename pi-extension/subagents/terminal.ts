@@ -7,7 +7,9 @@ import {
   createHerdrSurface,
   createHerdrSurfaceSplit,
   isHerdrAvailable,
+  getHerdrCallerWorkspaceId,
   getHerdrParentPaneId,
+  resolveHerdrWorkspaceId,
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
@@ -29,6 +31,7 @@ export interface TerminalLaunchRequest {
   readonly name: string;
   readonly task: string;
   readonly cwd: string;
+  readonly workspace?: string;
   readonly layout: SubagentLayout;
   readonly command: string;
   readonly scriptPath: string;
@@ -69,12 +72,22 @@ export function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
-function createTuiSurface(name: string, layout: SubagentLayout, cwd = process.cwd()): PaneId {
+function createTuiSurface(
+  name: string,
+  layout: SubagentLayout,
+  cwd = process.cwd(),
+  workspace?: string,
+): PaneId {
   if (layout !== "tab") {
     const parentPaneId = getHerdrParentPaneId();
-    if (parentPaneId) return createHerdrSurfaceSplit(name, layout, parentPaneId, cwd);
+    const callerWorkspaceId = getHerdrCallerWorkspaceId();
+    const targetWorkspaceId = resolveHerdrWorkspaceId({ cwd, workspace });
+    if (parentPaneId && (!callerWorkspaceId || targetWorkspaceId === callerWorkspaceId)) {
+      return createHerdrSurfaceSplit(name, layout, parentPaneId, cwd);
+    }
+    return createHerdrSurface(name, cwd, targetWorkspaceId);
   }
-  return createHerdrSurface(name, cwd);
+  return createHerdrSurface(name, cwd, workspace);
 }
 
 function createTuiBackend(): TerminalBackend {
@@ -82,7 +95,7 @@ function createTuiBackend(): TerminalBackend {
     kind: "herdr-tui",
     isAvailable: isHerdrAvailable,
     async launch(request) {
-      const paneId = createTuiSurface(request.name, request.layout, request.cwd);
+      const paneId = createTuiSurface(request.name, request.layout, request.cwd, request.workspace);
       try {
         reportHerdrPaneTask(paneId, request.task);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -202,9 +215,14 @@ export async function launchSubagentTerminal(request: TerminalLaunchRequest): Pr
   return backend.launch(request);
 }
 
-export function createSubagentSurface(name: string, layout: SubagentLayout = "tab"): PaneId {
+export function createSubagentSurface(
+  name: string,
+  layout: SubagentLayout = "tab",
+  cwd = process.cwd(),
+  workspace?: string,
+): PaneId {
   if (assertTerminalAvailable().kind !== "herdr-tui") throw new Error("Use launchSubagentTerminal for herdr-core");
-  return createTuiSurface(name, layout);
+  return createTuiSurface(name, layout, cwd, workspace);
 }
 
 export function createSubagentPane(name: string): PaneId {

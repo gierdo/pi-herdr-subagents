@@ -109,6 +109,8 @@ export PI_SUBAGENT_LAYOUT=split        # right-hand split
 # export PI_SUBAGENT_LAYOUT=split:down # split below
 ```
 
+When `PI_SUBAGENT_LAYOUT` is set to a split layout and a subagent targets a different Herdr workspace than the orchestrator (for example, an opened Git worktree workspace), the subagent opens in a new tab inside that target workspace rather than splitting the orchestrator's pane.
+
 Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
@@ -283,6 +285,10 @@ subagent({ name: "Planner", agent: "planner", task: "Work through the design wit
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+
+// Spawn inside a git worktree opened in Herdr (auto-detected from cwd, or pass workspace explicitly)
+subagent({ name: "Worker: Auth", agent: "worker", cwd: ".worktrees/feat-auth", task: "..." });
+subagent({ name: "Worker: Auth", agent: "worker", cwd: ".worktrees/feat-auth", workspace: "feat/auth", task: "..." });
 ```
 
 ### Parameters
@@ -299,7 +305,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
-| `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders) and [Git Worktrees in Herdr](#git-worktrees-in-herdr)) |
+| `workspace`            | string  | auto from `cwd` or caller workspace | Optional Herdr workspace ID, worktree path, branch name, or label to place the subagent tab in (see [Git Worktrees in Herdr](#git-worktrees-in-herdr)) |
 
 ---
 
@@ -345,6 +352,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `workspace` (optional): Herdr workspace ID, worktree path, branch name, or label to place the resumed tab in. When omitted, `subagent_resume` reads the original session's `cwd` from the session header (if the directory still exists) and routes the tab to that worktree's open Herdr workspace.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -578,6 +586,18 @@ cwd: ./agents/game-designer
 spawning: false
 ---
 ```
+
+---
+
+## Git Worktrees in Herdr
+
+When running in `herdr-tui`, opened Git worktrees (`herdr worktree create` or `herdr worktree open`) live in their own Herdr workspaces. When an orchestrator spawns or resumes a subagent targeting an open worktree, the subagent tab is placed directly inside that worktree's Herdr workspace instead of the orchestrator's workspace:
+
+1. **Automatic routing via `cwd`**: When `cwd` points to (or inside a subdirectory of) a Git worktree that is currently open in Herdr, the extension matches `cwd` against open worktrees (`herdr workspace list` and `herdr worktree list`) and creates the subagent tab in the matching workspace. When a linked worktree is nested inside the main checkout (for example, `.worktrees/feat-auth` inside `/repo`), the longest matching worktree path takes precedence.
+2. **Explicit `workspace` argument**: Pass `workspace` on `subagent` or `subagent_resume` to target a specific open Herdr workspace by workspace ID (`w2`), worktree path, branch name (`feat/auth`), or workspace/worktree label.
+3. **Fallback to the orchestrator's workspace**: If `cwd` or `workspace` does not match any worktree currently open in Herdr, tab creation falls back to the orchestrator's workspace without opening or creating new worktrees.
+4. **Split layout across workspaces**: When `PI_SUBAGENT_LAYOUT=split` (or `split:down`) is set and the target workspace differs from the orchestrator's workspace, the subagent opens as a tab inside the target worktree workspace rather than splitting the orchestrator's pane.
+5. **Session resume**: `subagent_resume` reads the session's recorded `cwd` from the `.jsonl` session header (falling back to the current directory if the worktree path no longer exists) so resumed sessions reopen in their worktree's workspace automatically.
 
 ---
 
